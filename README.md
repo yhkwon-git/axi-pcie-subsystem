@@ -10,6 +10,7 @@
 .
 ├── rtl/     합성 가능한 SystemVerilog
 ├── verif/   Cocotb 테스트, BFM, 시뮬레이터 러너
+├── asic/    Sky130 합성 스크립트, SDC, OpenSTA
 ├── docs/    아키텍처 노트, 어드레스 맵, 인터페이스 사양
 └── sim/     시뮬레이터 빌드, 로그, 웨이브, results.xml
 ```
@@ -31,71 +32,98 @@
 | `verif/test_pcie_to_axi_bridge.py` | 2DW Memory Write 후 Memory Read의 CplD |
 | `verif/scoreboard.py` | 예측한 write/read와 슬레이브 바이트, CplD, 큐 occupancy 비교 |
 | `verif/test_subsystem_top.py` | 탑: 1DW가 MI0/MI1로 갈라지고 Read ID가 추적됨 |
+| `docs/architecture.md` | 클록 도메인과 데이터 흐름 |
+| `docs/cdc_design_note.md` | CDC 원칙, Sky130 합성, 레이아웃 전 STA |
+| `asic/run_sky130.sh` | sv2v 후 Yosys로 Sky130 HD에 매핑 |
+| `asic/constraints.sdc` | `clk_pcie` 8 ns, `clk_axi` 10 ns, 비동기 클럭 그룹 |
+| `asic/run_sta.sh` | 같은 리버티로 OpenSTA 레이아웃 전 타이밍 |
 
 ## 블록 다이어그램
 
-탑 `nand_sol_subsystem_top`이 아래 제어 평면을 한 모듈로 묶는다. `clk_pcie`는 호스트 TLP와 완료 DWORD를 보고, `clk_axi`는 브리지 이후를 본다. 두 클록이 함께 들어가는 인스턴스는 요청 FIFO `u_tlp_ingress`와 완료 FIFO `u_cpl_egress`다. PHY와 컨트롤러 본체의 자리는 그대로다.
+탑 `nand_sol_subsystem_top`이 제어 평면을 한 모듈로 묶는다. `clk_pcie`는 호스트 TLP와 완료 DWORD만 보고, `clk_axi`는 브리지부터 목적지 포트까지를 본다. 두 클록이 함께 들어가는 인스턴스는 `u_tlp_ingress`와 `u_cpl_egress`다. 긴 설명은 `docs/architecture.md`, CDC와 타이밍 메모는 `docs/cdc_design_note.md`에 있다.
 
 ```text
-                         On-chip fabric (study notes)
- ┌──────────────────────────────────────────────────────────────────────────┐
- │                                                                          │
- │   Host / NVMe initiator                                                  │
- │            │                                                             │
- │            ▼                                                             │
- │   ┌────────────────────┐     TBD: lane, speed, PHY vendor               │
- │   │ PCIe PHY / PIPE    │                                                 │
- │   └─────────┬──────────┘                                                 │
- │             ▼                                                            │
- │   ┌────────────────────┐     TBD: Gen, MPS, MRRS, outstanding           │
- │   │ PCIe controller    │                                                 │
- │   │ TL / DLL / DMA     │                                                 │
- │   └─────────┬──────────┘                                                 │
- │             ▼                                                            │
- │   ┌────────────────────┐     IMPLEMENTED, basic MRd/MWr                │
- │   │ PCIe ↔ AXI bridge  │     3DW/4DW header, AXI4 INCR, CplD            │
- │   └─────────┬──────────┘                                                 │
- │             ▼                                                            │
- │   ┌────────────────────┐     IMPLEMENTED                                │
- │   │ AXI register slice │     AXI4-Lite, 1-cycle, full throughput        │
- │   └─────────┬──────────┘                                                 │
- │             ▼                                                            │
- │   ┌────────────────────┐     IMPLEMENTED, 2x2 AXI4-Lite                │
- │   │ Multi-layer AXI    │     round-robin, 64 KiB windows                │
- │   │ interconnect       │                                                 │
- │   └──┬────┬────┬────┬──┘                                                 │
- │      │    │    │    │                                                    │
- │      ▼    ▼    ▼    ▼                                                    │
- │    CPU  DMA  BUF  CSR                                                    │
- │     │         │    └── control/status    TBD: base, window               │
- │     │         └─────── packet buffer    TBD: depth, ports                │
- │     └───────────────── firmware master   TBD: AXI or AHB                 │
- │                                                                          │
- │   NAND channel controllers  [N = TBD]                                    │
- │   각 채널 앞에 레지스터 슬라이스 인스턴스  [placement = TBD]              │
- └──────────────────────────────────────────────────────────────────────────┘
+ clk_pcie                         clk_axi
+ ────────                         ───────
+
+ Host TLP DWORD
+      │
+      ▼
+ ┌────────────────┐
+ │ u_tlp_ingress  │  cdc_async_fifo
+ │ Gray + 2FF     │
+ └───────┬────────┘
+        │
+        ▼
+ ┌──────────────────┐     outstanding_queue
+ │ pcie_to_axi_bridge├──── AR에서 ID 할당
+ │ MRd / MWr → AXI4 │◄─── R에서 ID 해제, RID/RLAST
+ └────────┬─────────┘
+          │ AW W B AR R, length 1
+          ▼
+ ┌────────────────┐     cpu_axi ──► u_slice_cpu ──┐
+ │  u_slice_host  │                               │
+ └────────┬───────┘                               ▼
+          │                              ┌─────────────────┐
+          └─────────────────────────────►│  axi_crossbar   │
+                                         │  SI0 host       │
+                                         │  SI1 CPU        │
+                                         │  RR, 64 KiB     │
+                                         └───┬─────────┬───┘
+                                             │         │
+                                             ▼         ▼
+                                      u_slice_csr  u_slice_nand
+                                             │         │
+                                             ▼         ▼
+                                      m0 CSR window   m1 NAND window
+                                      0x0000_0000     0x0001_0000
+                                      –0x0000_FFFF    –0x0001_FFFF
+                                             │         │
+                                             ▼         ▼
+                                      CSR slave    NAND buffer SRAM
+                                                   (이 포트에 붙는 다음 블록)
+
+ 완료 CplD
+      ▲
+ ┌────┴───────────┐
+ │ u_cpl_egress   │  cdc_async_fifo
+ └────▲───────────┘
+      └── bridge completion, clk_axi → clk_pcie
 ```
 
 ```mermaid
-flowchart TD
-  HOST["Host / NVMe initiator"]
-  PHY["PCIe PHY / PIPE<br/>TBD: lane, speed"]
-  CTL["PCIe controller<br/>TBD: Gen, MPS, MRRS"]
-  BR["PCIe-AXI bridge<br/>MRd/MWr to AXI4, CDC FIFO"]
-  RS["AXI register slice<br/>AXI4-Lite, implemented"]
-  XBAR["AXI4-Lite crossbar 2x2<br/>RR arbitration, address decode"]
-  CPU["Firmware CPU master<br/>TBD"]
-  DMA["Host DMA master<br/>TBD"]
-  BUF["Packet buffer SRAM<br/>TBD: depth"]
-  CSR["Control / status registers<br/>TBD: base"]
-  NAND["NAND channel controllers<br/>N = TBD"]
+flowchart TB
+  subgraph PCIE["clk_pcie"]
+    TLP["Host TLP DWORD"]
+    CPL["CplD DWORD"]
+  end
 
-  HOST --> PHY --> CTL --> BR --> RS --> XBAR
-  CPU --> XBAR
-  DMA --> XBAR
-  XBAR --> BUF
-  XBAR --> CSR
-  XBAR --> NAND
+  ING["u_tlp_ingress<br/>cdc_async_fifo"]
+  EGR["u_cpl_egress<br/>cdc_async_fifo"]
+
+  subgraph AXI["clk_axi"]
+    BR["pcie_to_axi_bridge<br/>MRd / MWr, 이 탑은 length 1"]
+    OQ["outstanding_queue<br/>Read ID, depth 4"]
+    SH["u_slice_host"]
+    SC["u_slice_cpu"]
+    XB["axi_crossbar 2x2<br/>RR, 64 KiB windows"]
+    S0["u_slice_csr"]
+    S1["u_slice_nand"]
+    CPU["cpu_axi"]
+    M0["m0 CSR<br/>0x0000_0000 – 0x0000_FFFF"]
+    M1["m1 NAND window<br/>0x0001_0000 – 0x0001_FFFF"]
+  end
+
+  SRAM["NAND buffer SRAM<br/>m1에 붙는 다음 블록"]
+
+  TLP --> ING --> BR
+  BR -->|"AW W B AR R"| SH --> XB
+  CPU --> SC --> XB
+  XB --> S0 --> M0
+  XB --> S1 --> M1 --> SRAM
+  BR -->|"AR ID"| OQ
+  OQ -->|"RID, RLAST"| BR
+  BR --> EGR --> CPL
 ```
 
 데이터 평면(버스트 AXI4)과 제어 평면(AXI4-Lite)은 브리지 출구에서 갈라진다. 슬라이스와 크로스바는 제어 평면이다. 브리지는 AXI4 INCR로 나가며, `length==1`인 TLP는 비트 하나의 트랜잭션이다. 탑은 그 한 비트를 슬라이스와 크로스바로 넘긴다. 채널 리프는 페이로드 폭만 바꾸면 데이터 평면 슬라이스가 같은 스키드 구조를 쓴다.
@@ -206,5 +234,16 @@ make clean
 - 인터커넥트 포트 수를 2x2보다 키우고, 레이어와 QoS를 더하는 일
 - 데이터 평면 AXI4의 긴 버스트. 탑의 큐는 제어 평면 Read ID를 깊이 4까지 추적한다
 - PCIe PHY, DLL, 다중 outstanding completion
-- 낸드 채널을 MI1 뒤에서 여러 포트로 나누는 일
-- `docs/`의 인터페이스 사양과 어드레스 맵
+- 낸드 채널을 MI1의 NAND buffer 뒤에서 여러 포트로 나누는 일
+- 인터페이스 사양의 레지스터 맵
+
+## 커밋과 브랜치
+
+`main`은 시뮬레이터가 통과하는 탑을 둔다. 기능은 `feat/<block>` 브랜치에서 끝내고 `main`으로 합친다. 메시지는 한 줄이고, 종류는 이렇게 나눈다.
+
+| 접두어 | 쓸 때 | 이 저장소의 예 |
+| --- | --- | --- |
+| `feat:` | 새 RTL 또는 새 테스트 경로 | `feat: add gray-code async fifo` |
+| `fix:` | 시뮬레이션에서 틀린 동작 | `fix: index completion buffer with beat width` |
+| `test:` | 체크만 더할 때 | `test: scoreboard checks subsystem completions` |
+| `docs:` | README와 `docs/` | `docs: describe cdc and the control-plane path` |

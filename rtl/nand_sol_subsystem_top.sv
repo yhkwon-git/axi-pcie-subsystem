@@ -387,6 +387,7 @@ module nand_sol_subsystem_top #(
     end
   end
 
+`ifndef SYNTHESIS
   always_ff @(posedge clk_axi) begin
     if (rst_axi_n && br_awvalid && br_awready && (br_awlen != 8'd0)) begin
       $error("nand_sol_subsystem_top: control plane accepts AWLEN 0");
@@ -395,6 +396,7 @@ module nand_sol_subsystem_top #(
       $error("nand_sol_subsystem_top: control plane accepts ARLEN 0");
     end
   end
+`endif
 
   outstanding_queue #(
     .DEPTH   (OQ_DEPTH),

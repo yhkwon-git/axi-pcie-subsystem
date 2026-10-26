@@ -12,3 +12,6 @@ sim/**/*.log
 
 verif/sim_build/
 verif/results.xml
+
+asic/pdk/
+asic/build/

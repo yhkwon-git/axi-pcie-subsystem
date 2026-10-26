@@ -1,0 +1,12 @@
+# Map the sv2v netlist onto Sky130 HD, typical corner (25 C, 1.80 V).
+# asic/run_sky130.sh regenerates asic/build/subsystem.v and runs this script.
+
+read_verilog asic/build/subsystem.v
+hierarchy -check -top nand_sol_subsystem_top
+synth -top nand_sol_subsystem_top
+dfflibmap -liberty asic/pdk/sky130_fd_sc_hd__tt_025C_1v80.lib
+abc -liberty asic/pdk/sky130_fd_sc_hd__tt_025C_1v80.lib -D 10000
+hilomap -hicell sky130_fd_sc_hd__conb_1 HI -locell sky130_fd_sc_hd__conb_1 LO
+opt_clean
+stat -liberty asic/pdk/sky130_fd_sc_hd__tt_025C_1v80.lib
+write_verilog -noattr asic/build/nand_sol_subsystem_top.nl.v
