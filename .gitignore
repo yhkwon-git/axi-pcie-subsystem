@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+sim/build/
+sim/results.xml
+sim/transcript
+sim/**/*.fst
+sim/**/*.vcd
+sim/**/*.wlf
+sim/**/*.log
+
+verif/sim_build/
+verif/results.xml
