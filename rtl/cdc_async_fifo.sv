@@ -53,10 +53,13 @@ endmodule : cdc_sync_2ff
 // The extra pointer bit distinguishes full from empty after the address wraps.
 //
 // rd_data is the word at the current read address and is valid while
-// rd_empty is low. rd_en pops that word. A location is written on wr_clk and
-// is not visible to the reader until the Gray write pointer has landed in the
-// second read-domain synchronizer flop and the empty flag has been registered,
-// which is at least two rising edges of rd_clk after the write.
+// rd_empty is low. rd_en pops that word. The word is a flop output: each
+// rd_clk advances one mux2 of the binary read tree, and the tag has to match
+// rd_bin before the word is shown. A pop or a newly synchronized write
+// pointer makes rd_empty high until that tree finishes the new address.
+// A location is written on wr_clk and is not visible to the reader until the
+// Gray write pointer has landed in the second read-domain synchronizer flop,
+// the pipe has been flushed, and the tag has caught the read pointer.
 //
 // DEPTH is a power of two and at least 4. wr_rst_n / rd_rst_n must both be
 // asserted before use and each deasserted synchronously to its own clock.
@@ -92,11 +95,35 @@ module cdc_async_fifo #(
     return bin ^ (bin >> 1);
   endfunction
 
+  // +1 with the carry prefix taken only from the current pointer flops.
+  // wr_fire/rd_fire then AND into every bit in parallel, instead of rippling
+  // through the prefix. The ss liberty makes that ripple a multi-ns arc.
+  function automatic logic [PTR_W-1:0] bin_add_fire(
+    input logic [PTR_W-1:0] bin,
+    input logic             fire
+  );
+    logic [PTR_W-1:0] prefix;
+    logic [PTR_W-1:0] sum;
+    begin
+      prefix[0] = 1'b1;
+      for (int i = 1; i < PTR_W; i++) begin
+        prefix[i] = prefix[i - 1] & bin[i - 1];
+      end
+      for (int i = 0; i < PTR_W; i++) begin
+        sum[i] = bin[i] ^ (fire & prefix[i]);
+      end
+      return sum;
+    end
+  endfunction
+
   logic [WIDTH-1:0] mem [0:DEPTH-1];
 
   logic [PTR_W-1:0] wr_bin;
   logic [PTR_W-1:0] wr_gray;
   logic             wr_full_q;
+  logic             wr_pend_q;
+  logic [ADDR_W-1:0] wr_addr_q;
+  logic [WIDTH-1:0] wr_data_q;
   logic [PTR_W-1:0] rd_bin;
   logic [PTR_W-1:0] rd_gray;
   logic             rd_empty_q;
@@ -109,6 +136,7 @@ module cdc_async_fifo #(
   wire [PTR_W-1:0]  wr_gray_next;
   wire              wr_full_next;
   wire              rd_fire;
+  wire              rd_ready;
   wire [PTR_W-1:0]  rd_bin_next;
   wire [PTR_W-1:0]  rd_gray_next;
   wire              rd_empty_next;
@@ -129,15 +157,16 @@ module cdc_async_fifo #(
   );
 
   assign wr_fire      = wr_en & ~wr_full_q;
-  assign wr_bin_next  = wr_bin + {{(PTR_W-1){1'b0}}, wr_fire};
+  assign wr_bin_next  = bin_add_fire(wr_bin, wr_fire);
   assign wr_gray_next = bin2gray(wr_bin_next);
   // Next Gray write pointer meets the synchronized read pointer with the two
   // MSBs inverted exactly when this write would occupy the last free slot.
   assign wr_full_next = (wr_gray_next == {~rd_gray_in_wr[PTR_W-1:PTR_W-2],
                                           rd_gray_in_wr[PTR_W-3:0]});
 
-  assign rd_fire       = rd_en & ~rd_empty_q;
-  assign rd_bin_next   = rd_bin + {{(PTR_W-1){1'b0}}, rd_fire};
+  // A pop is ignored until the pipelined word is visible.
+  assign rd_fire       = rd_en & rd_ready;
+  assign rd_bin_next   = bin_add_fire(rd_bin, rd_fire);
   assign rd_gray_next  = bin2gray(rd_bin_next);
   assign rd_empty_next = (rd_gray_next == wr_gray_in_rd);
 
@@ -153,9 +182,28 @@ module cdc_async_fifo #(
     end
   end
 
+  // The pointer advances on the accepting clock. The memory write uses the
+  // address and data captured that cycle, one wr_clk later. The reader sees
+  // the new slot only after cdc_sync_2ff, which is two destination clocks,
+  // so the word is in mem before that pointer is visible.
+  always_ff @(posedge wr_clk or negedge wr_rst_n) begin
+    if (!wr_rst_n) begin
+      wr_pend_q <= 1'b0;
+    end else begin
+      wr_pend_q <= wr_fire;
+    end
+  end
+
   always_ff @(posedge wr_clk) begin
     if (wr_fire) begin
-      mem[wr_bin[ADDR_W-1:0]] <= wr_data;
+      wr_addr_q <= wr_bin[ADDR_W-1:0];
+      wr_data_q <= wr_data;
+    end
+  end
+
+  always_ff @(posedge wr_clk) begin
+    if (wr_pend_q) begin
+      mem[wr_addr_q] <= wr_data_q;
     end
   end
 
@@ -171,9 +219,71 @@ module cdc_async_fifo #(
     end
   end
 
+  // One mux2 per rd_clk. mux4/or4 fall delays in this ss liberty stay above
+  // 2 ns at the fastest table corner, so a 16:1 read in one cycle does not fit
+  // the 8 ns read clock after clock-to-q and setup. The tag records the
+  // address that entered with the data. A change in the synchronized write
+  // pointer flushes the tag: the slot was just written, and the previous
+  // pipe contents are the value from before that write.
+  localparam int LVLS = ADDR_W;
+
+  logic [WIDTH-1:0]  step_q [0:LVLS-1][0:(DEPTH/2)-1];
+  logic [ADDR_W-1:0] tag_q  [0:LVLS-1];
+  logic [LVLS-1:0]   tag_v;
+  logic [PTR_W-1:0]  wr_gray_seen;
+
+  genvar lvl, ix;
+  generate
+    for (lvl = 0; lvl < LVLS; lvl = lvl + 1) begin : g_rd
+      localparam int NW = DEPTH >> (lvl + 1);
+      for (ix = 0; ix < NW; ix = ix + 1) begin : g_w
+        if (lvl == 0) begin : g_mem
+          always_ff @(posedge rd_clk) begin
+            if (rd_bin[0]) begin
+              step_q[lvl][ix] <= mem[(ix << 1) + 1];
+            end else begin
+              step_q[lvl][ix] <= mem[(ix << 1) + 0];
+            end
+          end
+        end else begin : g_mux
+          always_ff @(posedge rd_clk) begin
+            if (tag_q[lvl - 1][lvl]) begin
+              step_q[lvl][ix] <= step_q[lvl - 1][(ix << 1) + 1];
+            end else begin
+              step_q[lvl][ix] <= step_q[lvl - 1][(ix << 1) + 0];
+            end
+          end
+        end
+      end
+    end
+  endgenerate
+
+  always_ff @(posedge rd_clk or negedge rd_rst_n) begin
+    if (!rd_rst_n) begin
+      wr_gray_seen <= '0;
+      tag_v        <= '0;
+      for (int i = 0; i < LVLS; i++) begin
+        tag_q[i] <= '0;
+      end
+    end else if (wr_gray_in_rd != wr_gray_seen) begin
+      wr_gray_seen <= wr_gray_in_rd;
+      tag_v        <= '0;
+    end else begin
+      wr_gray_seen <= wr_gray_in_rd;
+      tag_q[0]     <= rd_bin[ADDR_W-1:0];
+      tag_v[0]     <= 1'b1;
+      for (int i = 1; i < LVLS; i++) begin
+        tag_q[i] <= tag_q[i - 1];
+        tag_v[i] <= tag_v[i - 1];
+      end
+    end
+  end
+
+  assign rd_ready = ~rd_empty_q && tag_v[LVLS-1] &&
+                    (tag_q[LVLS-1] == rd_bin[ADDR_W-1:0]);
   assign wr_full  = wr_full_q;
-  assign rd_empty = rd_empty_q;
-  assign rd_data  = mem[rd_bin[ADDR_W-1:0]];
+  assign rd_empty = ~rd_ready;
+  assign rd_data  = step_q[LVLS-1][0];
 
 endmodule : cdc_async_fifo
 

@@ -58,6 +58,16 @@ DUTS = {
         "parameters": {"ADDR_WIDTH": 32, "DATA_WIDTH": 32},
         "build_dir": lambda sim: SIM_ROOT / "build" / "top" / sim,
     },
+    "gate": {
+        "toplevel": "nand_sol_subsystem_top",
+        "test_module": "test_subsystem_top",
+        "sources": [
+            ROOT / "asic" / "build" / "sky130_fd_sc_hd_func.v",
+            ROOT / "asic" / "build" / "nand_sol_subsystem_top.nl.v",
+        ],
+        "parameters": {},
+        "build_dir": lambda sim: SIM_ROOT / "build" / "gate" / sim,
+    },
 }
 
 
@@ -129,15 +139,17 @@ def run(sim: str, dut: str, waves: bool, testcase: str | None) -> None:
     # Icarus already passes -g2012. Verilator should keep going on lint so the
     # functional tests still run.
     build_args = [] if sim == "icarus" else ["-Wno-fatal"]
+    params = spec["parameters"] if "parameters" in spec else {"ADDR_WIDTH": 32, "DATA_WIDTH": 32}
     build_kwargs = {
         "hdl_toplevel": spec["toplevel"],
-        "parameters": spec.get("parameters", {"ADDR_WIDTH": 32, "DATA_WIDTH": 32}),
         "build_args": build_args,
         "always": True,
         "build_dir": build_dir,
         "waves": waves,
         "timescale": ("1ns", "1ps"),
     }
+    if params:
+        build_kwargs["parameters"] = params
     # Cocotb 2 compiles both `sources` and `verilog_sources`. Pass the file once.
     if _accepts(runner.build, "sources"):
         build_kwargs["sources"] = sources

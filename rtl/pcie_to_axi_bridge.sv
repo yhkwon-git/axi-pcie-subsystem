@@ -194,15 +194,39 @@ module pcie_to_axi_bridge #(
   wire         tlp_fire;
   wire         push_hdr;
   wire         push_data;
+  wire         parser_ready;
 
-  assign tlp_ready = (in_state == IN_DROP) || ~req_full;
-  assign tlp_fire  = tlp_valid & tlp_ready;
+  logic        tlp_valid_q;
+  logic        tlp_sop_q;
+  logic        tlp_eop_q;
+  logic [31:0] tlp_data_q;
+
+  // The parser and the request-FIFO write see a registered TLP beat, so the
+  // ingress read flop does not drive the FIFO memory mux in the same cycle.
+  assign parser_ready = (in_state == IN_DROP) || ~req_full;
+  assign tlp_ready    = parser_ready;
+
+  always_ff @(posedge pclk or negedge p_rst_n) begin
+    if (!p_rst_n) begin
+      tlp_valid_q <= 1'b0;
+      tlp_sop_q   <= 1'b0;
+      tlp_eop_q   <= 1'b0;
+      tlp_data_q  <= '0;
+    end else if (parser_ready) begin
+      tlp_valid_q <= tlp_valid;
+      tlp_sop_q   <= tlp_sop;
+      tlp_eop_q   <= tlp_eop;
+      tlp_data_q  <= tlp_data;
+    end
+  end
+
+  assign tlp_fire  = tlp_valid_q & parser_ready;
   assign push_hdr  = tlp_fire & (((in_state == IN_DW2) & ~in_4dw) | (in_state == IN_DW3));
   assign push_data = tlp_fire & (in_state == IN_PAY);
   assign req_wr_en = push_hdr | push_data;
   assign req_wr_data = push_data
-    ? {1'b0, 1'b0, tlp_data, 10'd0, 4'd0, 4'd0, 16'd0, 8'd0}
-    : {1'b1, in_write, tlp_data, in_len, in_lbe, in_fbe, in_req, in_tag};
+    ? {1'b0, 1'b0, tlp_data_q, 10'd0, 4'd0, 4'd0, 16'd0, 8'd0}
+    : {1'b1, in_write, tlp_data_q, in_len, in_lbe, in_fbe, in_req, in_tag};
   assign tlp_error = tlp_error_q;
 
   always_ff @(posedge pclk or negedge p_rst_n) begin
@@ -222,29 +246,29 @@ module pcie_to_axi_bridge #(
       if (tlp_fire) begin
         case (in_state)
           IN_IDLE: begin
-            if (!tlp_sop || (tlp_data[28:24] != 5'b00000) || (tlp_data[9:0] == 10'd0) ||
-                (tlp_data[9:0] > 10'(MAX_DW))) begin
+            if (!tlp_sop_q || (tlp_data_q[28:24] != 5'b00000) || (tlp_data_q[9:0] == 10'd0) ||
+                (tlp_data_q[9:0] > 10'(MAX_DW))) begin
               tlp_error_q <= 1'b1;
-              in_state    <= (!tlp_sop || tlp_eop) ? IN_IDLE : IN_DROP;
+              in_state    <= (!tlp_sop_q || tlp_eop_q) ? IN_IDLE : IN_DROP;
             end else begin
-              in_write <= tlp_data[30];
-              in_4dw   <= tlp_data[29];
-              in_len   <= tlp_data[9:0];
+              in_write <= tlp_data_q[30];
+              in_4dw   <= tlp_data_q[29];
+              in_len   <= tlp_data_q[9:0];
               in_state <= IN_DW1;
             end
           end
           IN_DW1: begin
-            in_req   <= tlp_data[31:16];
-            in_tag   <= tlp_data[15:8];
-            in_lbe   <= tlp_data[7:4];
-            in_fbe   <= tlp_data[3:0];
+            in_req   <= tlp_data_q[31:16];
+            in_tag   <= tlp_data_q[15:8];
+            in_lbe   <= tlp_data_q[7:4];
+            in_fbe   <= tlp_data_q[3:0];
             in_state <= IN_DW2;
           end
           IN_DW2: begin
             if (in_4dw) begin
-              if (tlp_data != 32'd0) begin
+              if (tlp_data_q != 32'd0) begin
                 tlp_error_q <= 1'b1;
-                in_state    <= tlp_eop ? IN_IDLE : IN_DROP;
+                in_state    <= tlp_eop_q ? IN_IDLE : IN_DROP;
               end else begin
                 in_state <= IN_DW3;
               end
@@ -271,7 +295,7 @@ module pcie_to_axi_bridge #(
             end
           end
           IN_DROP: begin
-            if (tlp_eop) begin
+            if (tlp_eop_q) begin
               in_state <= IN_IDLE;
             end
           end
@@ -378,6 +402,17 @@ module pcie_to_axi_bridge #(
   assign m_axi_arvalid = (ax_state == AX_AR);
   assign m_axi_rready  = (ax_state == AX_R);
 
+  // br_arready includes the outstanding-queue ID check. Sampling it keeps
+  // that cone off the AXI state flops. Valid stays high until this fires.
+  logic m_axi_arready_q;
+  always_ff @(posedge aclk or negedge a_rst_n) begin
+    if (!a_rst_n) begin
+      m_axi_arready_q <= 1'b0;
+    end else begin
+      m_axi_arready_q <= m_axi_arready;
+    end
+  end
+
   assign cpl_dw0 = {3'b010, 5'b01010, 14'd0, ax_len};
   assign cpl_dw1 = {COMPLETER_ID, ax_status, 1'b0, ax_bytes};
   assign cpl_dw2 = {ax_req, ax_tag, 1'b0, ax_lower};
@@ -442,7 +477,7 @@ module pcie_to_axi_bridge #(
           end
         end
         AX_AR: begin
-          if (m_axi_arvalid && m_axi_arready) begin
+          if (m_axi_arvalid && m_axi_arready_q) begin
             ax_beat  <= '0;
             ax_state <= AX_R;
           end

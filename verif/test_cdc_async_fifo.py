@@ -131,7 +131,9 @@ async def test_empty_waits_for_write_pointer_sync(dut):
     """Empty falls only after the Gray write pointer crosses into rd_clk.
 
     Two synchronizer flops plus the registered empty flag mean the read side
-    cannot see the word on the first destination edge after the write.
+    cannot see the word on the first destination edge after the write. The
+    read pipe then takes one rd_clk per address bit, so empty may fall a few
+    edges later than the pointer sync alone.
     """
     await reset_fifo(dut)
     await write_word(dut, 0x5A)
@@ -148,7 +150,7 @@ async def test_empty_waits_for_write_pointer_sync(dut):
         raise AssertionError("rd_empty stayed high after the write pointer should have synced")
 
     assert edges >= 2, f"empty fell after {edges} rd_clk edges; synchronizer was bypassed"
-    assert edges <= 6, f"empty fell after {edges} rd_clk edges; pointer sync looks stuck"
+    assert edges <= 12, f"empty fell after {edges} rd_clk edges; pointer sync looks stuck"
     assert await read_word(dut) == 0x5A
 
 

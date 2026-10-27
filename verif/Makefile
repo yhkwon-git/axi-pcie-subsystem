@@ -19,7 +19,7 @@ PYTHON   ?= python
 
 help:
 	@echo "Targets: sim, clean"
-	@echo "Variables: DUT=(slice|crossbar|fifo|bridge|top) SIM=(icarus|verilator) WAVES=(0|1) TESTCASE=<cocotb test name> PYTHON=<interpreter>"
+	@echo "Variables: DUT=(slice|crossbar|fifo|bridge|top|gate) SIM=(icarus|verilator) WAVES=(0|1) TESTCASE=<cocotb test name> PYTHON=<interpreter>"
 
 sim:
 	$(PYTHON) run_sim.py --sim $(SIM) --dut $(DUT) --waves $(WAVES) $(if $(TESTCASE),--testcase $(TESTCASE),)

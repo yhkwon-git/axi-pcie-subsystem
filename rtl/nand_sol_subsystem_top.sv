@@ -25,7 +25,8 @@
 // outstanding_queue watches the host AR/R handshake. A new AR is accepted
 // only while the queue has a free slot and that read ID is not already in
 // flight. The lite slaves have no RID, so the queue puts the oldest in-flight
-// ID back on the bridge's RID with RLAST when the R beat returns.
+// ID back on the bridge's RID with RLAST when the R beat returns. That beat
+// pops the head slot. The ID is not fed back into the queue in the same cycle.
 // -----------------------------------------------------------------------------
 
 module nand_sol_subsystem_top #(
@@ -410,8 +411,9 @@ module nand_sol_subsystem_top #(
     .alloc_ready  (alloc_ready),
     .alloc_id     (br_arid),
     .alloc_addr   (br_araddr),
-    .retire_valid (br_rvalid & br_rready & oldest_valid),
-    .retire_id    (oldest_id),
+    .retire_valid (1'b0),
+    .retire_id    ('0),
+    .retire_head  (br_rvalid & br_rready & oldest_valid),
     .retire_hit   (retire_hit),
     .retire_addr  (retire_addr),
     .empty        (oq_empty),
